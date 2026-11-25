@@ -151,70 +151,82 @@ GitHub Actions 工作流会生成并上传两个独立 Artifact：
 
 **从 v1.3.0 离线版切换到 v1.4.0 的历史边界：** v1.3.0 没有云端登记历史。若升级时原来的 ProgramData/注册表记录仍在，v1.4.0 会识别并拒绝重新领取；但若用户在升级前已经同时清除了 v1.3.0 的全部本地记录，云端无法知道其过去曾经试用过，首次云端登记可能成为该设备的第一次云端记录。这是首次引入服务器登记时无法追溯补齐的历史数据，不应宣传为可追溯封堵所有旧版本重置。
 
-## A. 创建 Cloudflare 服务（首次配置）
+## A. Cloudflare 首次配置（推荐全程使用网页 + GitHub Actions）
 
-需要：Cloudflare 账户、Node.js LTS/npm、OpenSSL。进入项目的 `cloudflare` 目录执行。
+部署不需要在个人 Windows 电脑安装 Node.js、npm、OpenSSL 或 Wrangler。GitHub Actions 会在云端安装 Wrangler、测试 Worker、执行 D1 schema，并部署 Worker。你只需在 Cloudflare 网页创建一次 D1 数据库、生成一次签名密钥，并把配置放入 GitHub Actions。
 
-### 1. 生成独立试用 Ed25519 密钥
+### 1. 创建 Cloudflare D1 数据库（仅首次）
 
-```powershell
-cd cloudflare
-.\generate-trial-keys.ps1
-```
+1. 登录 https://dash.cloudflare.com/ 。
+2. 打开 **Workers & Pages → D1 SQL Database**（不同语言界面名称可能略有差异）。
+3. 点击 **Create database**，名称填写 `networktoolkit-trials`。
+4. 创建后复制数据库 UUID（Database ID），不要把它当作密码；后续作为 GitHub Actions Variable 保存。
 
-脚本输出两段 Base64：
+### 2. 生成独立试用 Ed25519 密钥（一次性）
 
-- `TRIAL_SIGNING_PRIVATE_KEY_B64`：仅用于 Cloudflare Worker Secret。绝对不要提交 GitHub、不要放进 EXE。
-- `TRIAL_PUBLIC_KEY_B64`：稍后粘贴到客户端 `Main.kt`。公钥可以随 EXE 发布。
+密钥必须是 Ed25519 PKCS#8 私钥，客户端使用对应的 DER/SPKI 公钥。可在可信的密钥生成环境运行项目中的 `cloudflare/generate-trial-keys.ps1`，也可以使用你已有的安全密钥管理流程。此步骤只需生成一次，不需要在每次部署时重新生成。
 
-私钥 PEM/DER 文件已加入 `.gitignore`。建议另存一份离线加密备份；私钥丢失后，旧凭证仍可由客户端公钥验证，但服务器不能签发新凭证。若更换试用签名密钥，必须重新构建并发布客户端。
+脚本输出：
 
-### 2. 安装 Wrangler 并登录
+- `TRIAL_SIGNING_PRIVATE_KEY_B64`：仅放入 GitHub Actions Secret，绝不能提交到 GitHub 文件、Issue、日志或 EXE。
+- `TRIAL_PUBLIC_KEY_B64`：稍后写入 Windows 客户端 `Main.kt`，公钥可以公开。
+
+建议把私钥另存一份离线加密备份。私钥丢失后，服务器不能再签发新凭证；更换密钥需要同步更新客户端公钥并重新构建客户端。
+
+### 3. 创建 Cloudflare API Token（一次性）
+
+在 Cloudflare Dashboard → **My Profile → API Tokens → Create Token** 创建专用 Token。只授予部署所需的账户级权限：Workers Scripts 编辑、D1 编辑，以及 Wrangler 所需的账户读取权限；资源范围限制到你的目标账户。不要使用 Global API Key。复制 Token，它只会显示一次。
+
+### 4. 在 GitHub 配置 Secrets 和 Variables
+
+打开仓库 `wongvince/nettoo1` → **Settings → Secrets and variables → Actions**。
+
+在 **Secrets** 中新增：
+
+| 名称 | 内容 |
+|---|---|
+| `CLOUDFLARE_API_TOKEN` | 第 3 步创建的 Cloudflare API Token |
+| `TRIAL_SIGNING_PRIVATE_KEY_B64` | 第 2 步生成的试用私钥 Base64 |
+
+在 **Variables** 中新增：
+
+| 名称 | 内容 |
+|---|---|
+| `CLOUDFLARE_ACCOUNT_ID` | Cloudflare 账户 ID |
+| `CLOUDFLARE_DATABASE_ID` | 第 1 步 D1 数据库 ID |
+
+注意：Secret 与 Variable 名称必须完全一致。私钥只能放在 Secret，不能放在 Variable。
+
+### 5. 手动首次部署
+
+1. 打开 GitHub 仓库 → **Actions**。
+2. 左侧选择 **NetworkToolkit Cloudflare Trial API Deploy**。
+3. 点击 **Run workflow**，选择包含此 workflow 的分支（例如 `v1.4.0-cloud-trial` 或 `main`）。
+4. 点击绿色 **Run workflow**。
+5. 等待所有步骤变绿。日志中 `Deploy Worker` 步骤会显示 Worker URL，形式类似 `https://networktoolkit-trial-api.<账户子域>.workers.dev`。
+6. 在浏览器打开 `https://你的Worker地址/health`，应返回 `ok: true`。
+
+工作流会先执行 Worker 语法检查和自动测试，再执行可重复运行的 D1 建表语句，最后部署 Worker。若缺少 Secret/Variable、API Token 权限不足或 D1 ID 错误，工作流会失败并指出对应步骤。
+
+### 6. 后续自动部署
+
+自动部署触发条件是：向 `main` 分支推送/合并 `cloudflare/**` 或 `.github/workflows/deploy-cloudflare.yml` 的变更。其他文件（例如 Windows UI 或网络工具）变化不会触发 Cloudflare 部署。也可以随时回到 Actions 页面手动点击 **Run workflow**。
+
+首次部署建议先从 `v1.4.0-cloud-trial` 分支手动运行，验收通过后再合并到 `main`。生产环境建议在 GitHub **Settings → Environments** 创建 `cloudflare-production` 环境，并按需配置 Required reviewers，避免未经审核的生产部署。
+
+### 7. 本地备用部署（可选）
+
+如果以后需要在本机调试，仍可进入 `cloudflare` 目录，使用 Node.js LTS、npm 和 Wrangler。常用命令：
 
 ```powershell
 npm install
+npm test
 npx wrangler login
-```
-
-### 3. 创建 D1 数据库
-
-```powershell
-npx wrangler d1 create networktoolkit-trials
-```
-
-命令会输出 `database_id`。打开 `cloudflare/wrangler.toml`，把 `REPLACE_WITH_D1_DATABASE_ID` 替换为真实 ID，保留数据库名称 `networktoolkit-trials` 和绑定名称 `DB`。
-
-### 4. 建表
-
-```powershell
 npx wrangler d1 execute networktoolkit-trials --remote --file=./schema.sql
-```
-
-### 5. 设置服务端私钥
-
-```powershell
-npx wrangler secret put TRIAL_SIGNING_PRIVATE_KEY_B64
-```
-
-命令提示输入时，粘贴密钥生成脚本输出的 `TRIAL_SIGNING_PRIVATE_KEY_B64` 那一整行。不要把它写进 `wrangler.toml`、源码或 GitHub Actions。
-
-### 6. 部署 Worker
-
-```powershell
 npx wrangler deploy
 ```
 
-部署完成会显示类似：
-
-`https://networktoolkit-trial-api.<你的账户子域>.workers.dev`
-
-检查服务：
-
-```powershell
-Invoke-RestMethod https://你的Worker地址/health
-```
-
-应返回 `ok = true`。健康检查不创建试用记录。
+本地部署前仍需把 `wrangler.toml` 中的 `REPLACE_WITH_D1_DATABASE_ID` 换成真实 D1 ID，并配置 Worker Secret。日常部署优先使用 GitHub Actions，避免个人电脑环境差异。
 
 ## B. 配置 Windows 客户端
 
@@ -240,9 +252,9 @@ Windows 10/11 x64、JDK 17、Gradle 8.10.2 环境下：
 gradle packageReleaseExe createDistributable
 ```
 
-产物位于 `build/compose/binaries/`。也可把完整项目推送到 `wongvince/nettoo1`，先运行 Actions 的手动构建，确认无误后再推送 `v1.4.0` 标签触发 Release。
+产物位于 `build/compose/binaries/`。也可把完整项目推送到 `wongvince/nettoo1`，运行现有 Windows 构建 workflow 的手动构建，确认无误后再推送 `v1.4.0` 标签触发 Release。Cloudflare 部署由独立的 `deploy-cloudflare.yml` 负责，两条 workflow 相互独立。
 
-**重要：** GitHub Actions 不会替你自动创建 Cloudflare D1、部署 Worker 或把私钥注入客户端。必须先完成 A、B，再构建客户端。源码包内没有预置你的账户 URL、D1 ID 或任何私钥。
+**重要：** GitHub Actions 可以自动部署 Worker 和初始化 D1 表，但不会替你创建 Cloudflare 账户/D1 数据库，也不会自动把 Worker URL、公钥写入 Windows 客户端。首次仍需按 A 节配置 Cloudflare 资源与 GitHub Secrets/Variables，并按 B 节把 Worker URL、公钥填入客户端后再构建。源码包内没有预置你的账户 URL、D1 ID 或任何私钥。
 
 ## D. 首次试用验收清单
 
