@@ -39,7 +39,7 @@ private const val DEFAULT_RELEASE_API =
 private const val RELEASE_PAGE_URL = "https://github.com/wongvince/nettoo1/releases/latest"
 
 // Set this to your deployed Cloudflare Worker URL before building the client.
-private const val TRIAL_API_BASE_URL = "https://REPLACE-WITH-YOUR-WORKER.workers.dev"
+private const val TRIAL_API_BASE_URL = "https://networktoolkit-trial-api.huangsxint.workers.dev"
 // Replace with the Base64 DER/SPKI public key generated for the TRIAL signing key only.
 private const val TRIAL_PUBLIC_KEY_B64 = "MCowBQYDK2VwAyEAQQq5wfOrcc0ahLR/Ins1ypYtaVl9zBadbWH0iNk/lK8="
 
