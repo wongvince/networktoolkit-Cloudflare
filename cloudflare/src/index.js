@@ -5,7 +5,7 @@ function json(data, status = 200) {
     status,
     headers: {
       "content-type": "application/json; charset=utf-8",
-      "cache-control": "no-store",
+      "cache-control": "no-store, max-age=0",
       "x-content-type-options": "nosniff",
     },
   });
@@ -25,8 +25,10 @@ function bytesToBase64Url(bytes) {
 }
 
 async function signTrialToken(deviceHash, issuedAt, expiresAt, env) {
-  if (!env.TRIAL_SIGNING_PRIVATE_KEY_B64) throw new Error("TRIAL_SIGNING_PRIVATE_KEY_B64 secret is missing");
-  const pkcs8 = base64ToBytes(env.TRIAL_SIGNING_PRIVATE_KEY_B64);
+  if (!env || typeof env.TRIAL_SIGNING_PRIVATE_KEY_B64 !== "string" || !env.TRIAL_SIGNING_PRIVATE_KEY_B64) {
+    throw new Error("TRIAL_SIGNING_PRIVATE_KEY_B64 secret is missing");
+  }
+  const pkcs8 = base64ToBytes(env.TRIAL_SIGNING_PRIVATE_KEY_B64.trim());
   const privateKey = await crypto.subtle.importKey(
     "pkcs8",
     pkcs8,
@@ -41,65 +43,91 @@ async function signTrialToken(deviceHash, issuedAt, expiresAt, env) {
   return `${bytesToBase64Url(payloadBytes)}.${bytesToBase64Url(signature)}`;
 }
 
+async function handleRequest(request, env) {
+  const url = new URL(request.url);
+
+  // Keep health independent of D1 and signing secrets so it remains a useful
+  // deployment/runtime probe even before trial registration is configured.
+  if (request.method === "GET" && url.pathname === "/health") {
+    return json({
+      ok: true,
+      service: "NetworkToolkit Trial API",
+      version: "1.4.0",
+      runtime: "cloudflare-workers",
+    });
+  }
+
+  if (request.method !== "POST" || url.pathname !== "/v1/trial/register") {
+    return json({ error: "not_found" }, 404);
+  }
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ error: "invalid_json" }, 400);
+  }
+
+  const deviceHash = typeof body?.deviceId === "string" ? body.deviceId.toLowerCase() : "";
+  if (!/^[a-f0-9]{64}$/.test(deviceHash)) {
+    return json({ error: "invalid_device_id" }, 400);
+  }
+
+  const duration = Number(env?.TRIAL_DURATION_MS || "86400000");
+  if (!Number.isSafeInteger(duration) || duration !== 86400000) {
+    return json({ error: "invalid_server_trial_duration" }, 500);
+  }
+  if (!env?.DB || typeof env.DB.prepare !== "function") {
+    console.error("NetworkToolkit configuration error: D1 binding DB is unavailable");
+    return json({ error: "trial_service_unavailable", detail: "database_binding_unavailable" }, 503);
+  }
+
+  try {
+    const now = Date.now();
+    const token = await signTrialToken(deviceHash, now, now + duration, env);
+    const inserted = await env.DB.prepare(
+      "INSERT OR IGNORE INTO trial_devices (device_hash, issued_at, expires_at) VALUES (?, ?, ?)",
+    ).bind(deviceHash, now, now + duration).run();
+
+    if (!inserted?.meta || inserted.meta.changes !== 1) {
+      const existing = await env.DB.prepare(
+        "SELECT issued_at, expires_at FROM trial_devices WHERE device_hash = ?",
+      ).bind(deviceHash).first();
+      if (!existing || Date.now() >= Number(existing.expires_at)) {
+        return json({ error: "trial_already_claimed" }, 409);
+      }
+      const originalIssuedAt = Number(existing.issued_at);
+      const originalExpiresAt = Number(existing.expires_at);
+      const recoveryToken = await signTrialToken(deviceHash, originalIssuedAt, originalExpiresAt, env);
+      return json({ token: recoveryToken, issuedAt: originalIssuedAt, expiresAt: originalExpiresAt,
+        durationMs: duration, recovered: true }, 200);
+    }
+
+    return json({ token, issuedAt: now, expiresAt: now + duration, durationMs: duration }, 201);
+  } catch (error) {
+    // Log the exception for Cloudflare Workers Logs without exposing secret values.
+    console.error({
+      event: "trial_registration_failed",
+      message: String(error?.message || error),
+      stack: typeof error?.stack === "string" ? error.stack : undefined,
+    });
+    return json({ error: "trial_service_unavailable", detail: String(error?.message || error) }, 503);
+  }
+}
+
 export default {
   async fetch(request, env) {
-    const url = new URL(request.url);
-    if (request.method === "GET" && url.pathname === "/health") {
-      return json({ ok: true, service: "NetworkToolkit Trial API" });
-    }
-
-    if (request.method !== "POST" || url.pathname !== "/v1/trial/register") {
-      return json({ error: "not_found" }, 404);
-    }
-
-    let body;
     try {
-      body = await request.json();
-    } catch {
-      return json({ error: "invalid_json" }, 400);
-    }
-
-    const deviceHash = typeof body.deviceId === "string" ? body.deviceId.toLowerCase() : "";
-    if (!/^[a-f0-9]{64}$/.test(deviceHash)) {
-      return json({ error: "invalid_device_id" }, 400);
-    }
-
-    const duration = Number(env.TRIAL_DURATION_MS || "86400000");
-    if (!Number.isSafeInteger(duration) || duration !== 86400000) {
-      return json({ error: "invalid_server_trial_duration" }, 500);
-    }
-
-    const issuedAt = Date.now();
-    const expiresAt = issuedAt + duration;
-
-    try {
-      // Validate signing configuration before reserving the device in D1.
-      const token = await signTrialToken(deviceHash, issuedAt, expiresAt, env);
-      const inserted = await env.DB.prepare(
-        "INSERT OR IGNORE INTO trial_devices (device_hash, issued_at, expires_at) VALUES (?, ?, ?)",
-      ).bind(deviceHash, issuedAt, expiresAt).run();
-
-      if (!inserted.meta || inserted.meta.changes !== 1) {
-        // A retry after a lost HTTP response may recover the SAME original window.
-        // This never moves issued_at/expires_at forward and therefore cannot reset trial time.
-        const existing = await env.DB.prepare(
-          "SELECT issued_at, expires_at FROM trial_devices WHERE device_hash = ?",
-        ).bind(deviceHash).first();
-        if (!existing || Date.now() >= Number(existing.expires_at)) {
-          return json({ error: "trial_already_claimed" }, 409);
-        }
-        const originalIssuedAt = Number(existing.issued_at);
-        const originalExpiresAt = Number(existing.expires_at);
-        const recoveryToken = await signTrialToken(deviceHash, originalIssuedAt, originalExpiresAt, env);
-        return json({ token: recoveryToken, issuedAt: originalIssuedAt, expiresAt: originalExpiresAt,
-          durationMs: duration, recovered: true }, 200);
-      }
-
-      return json({ token, issuedAt, expiresAt, durationMs: duration }, 201);
+      return await handleRequest(request, env);
     } catch (error) {
-      // If signing fails after the insert, the row remains reserved. This intentionally
-      // fails closed; an operator can inspect/delete that one row after fixing the key.
-      return json({ error: "trial_service_unavailable", detail: String(error?.message || error) }, 503);
+      // Catch unexpected route/runtime exceptions and return a traceable 500
+      // instead of Cloudflare's generic 1101 page where possible.
+      console.error({
+        event: "worker_unhandled_exception",
+        message: String(error?.message || error),
+        stack: typeof error?.stack === "string" ? error.stack : undefined,
+      });
+      return json({ error: "internal_error", message: "Worker request failed" }, 500);
     }
   },
 };
