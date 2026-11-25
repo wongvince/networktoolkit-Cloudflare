@@ -13,3 +13,7 @@ TRIAL_DURATION_MS = "86400000"
 [observability]
 enabled = true
 head_sampling_rate = 1.0
+
+[observability.logs]
+enabled = true
+invocation_logs = true
