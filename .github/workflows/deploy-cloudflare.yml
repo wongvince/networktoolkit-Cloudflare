@@ -1,14 +1,12 @@
 name: NetworkToolkit Cloudflare Trial API Deploy
 
 on:
-  # Automatic production deployment: merge/push Cloudflare changes to main.
   push:
     branches:
       - main
     paths:
       - 'cloudflare/**'
       - '.github/workflows/deploy-cloudflare.yml'
-  # Manual deployment: Actions -> this workflow -> Run workflow.
   workflow_dispatch:
 
 permissions:
@@ -20,7 +18,7 @@ concurrency:
 
 jobs:
   deploy:
-    name: Test and deploy Cloudflare Worker + D1
+    name: Test, deploy and diagnose Cloudflare Worker
     runs-on: ubuntu-latest
     environment: cloudflare-production
     defaults:
@@ -30,6 +28,7 @@ jobs:
       CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
       CLOUDFLARE_DATABASE_ID: ${{ vars.CLOUDFLARE_DATABASE_ID }}
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      WORKER_NAME: networktoolkit-trial-api
 
     steps:
       - name: Checkout repository
@@ -48,11 +47,14 @@ jobs:
         with:
           node-version: '22'
 
-      - name: Install Cloudflare Wrangler
+      - name: Install Wrangler
         run: npm install --no-save --no-package-lock
 
-      - name: Test Worker source
+      - name: Record tool version and test Worker source
+        shell: bash
         run: |
+          set -euo pipefail
+          npx wrangler --version
           node --check ./src/index.js
           npm test
 
@@ -69,6 +71,7 @@ jobs:
             if (!source.includes("REPLACE_WITH_D1_DATABASE_ID") && !source.includes(id)) throw new Error("Unexpected database_id in wrangler.toml");
             fs.writeFileSync(file, source.replace("REPLACE_WITH_D1_DATABASE_ID", id));
           '
+          echo 'D1 database ID injected. The value is intentionally not printed.'
 
       - name: Apply idempotent D1 schema
         run: npx wrangler d1 execute networktoolkit-trials --remote --file=./schema.sql
@@ -76,22 +79,80 @@ jobs:
       - name: Deploy Worker
         run: npx wrangler deploy
 
-      - name: Verify production Worker health endpoint
+      - name: Collect deployment and live Worker diagnostics
+        id: diagnose
+        shell: bash
+        continue-on-error: true
+        run: |
+          set -u
+          DIAG_DIR="$RUNNER_TEMP/nt-worker-diagnostics"
+          mkdir -p "$DIAG_DIR"
+          echo "Wrangler version: $(npx wrangler --version 2>&1 | tail -n 1)" | tee "$DIAG_DIR/tool-version.txt"
+
+          echo '=== Recent Cloudflare deployments ===' | tee "$DIAG_DIR/deployments.txt"
+          npx wrangler deployments list --name "$WORKER_NAME" 2>&1 | tee -a "$DIAG_DIR/deployments.txt" || true
+
+          TAIL_FILE="$DIAG_DIR/wrangler-tail.jsonl"
+          echo '=== Starting live tail for 35 seconds ==='
+          timeout 35s npx wrangler tail "$WORKER_NAME" --format json --sampling-rate 1 >"$TAIL_FILE" 2>&1 &
+          TAIL_PID=$!
+          sleep 8
+
+          URL="https://${WORKER_NAME}.huangsxint.workers.dev/health"
+          DIAG_ID="nt-gha-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "Diagnostic request ID: $DIAG_ID" | tee "$DIAG_DIR/request-id.txt"
+          STATUS="$(curl --silent --show-error --connect-timeout 10 --max-time 20 \
+            -H "x-nt-diagnostic-id: $DIAG_ID" \
+            --dump-header "$DIAG_DIR/health-headers.txt" \
+            --output "$DIAG_DIR/health-body.txt" \
+            --write-out '%{http_code}' "$URL" 2>"$DIAG_DIR/curl-error.txt" || true)"
+          echo "$STATUS" | tee "$DIAG_DIR/health-status.txt"
+          echo "Health HTTP status: ${STATUS:-no-response}"
+          echo '=== Health response headers ==='
+          cat "$DIAG_DIR/health-headers.txt" 2>/dev/null || true
+          echo '=== Health response body ==='
+          cat "$DIAG_DIR/health-body.txt" 2>/dev/null || true
+          echo
+          echo '=== curl diagnostics ==='
+          cat "$DIAG_DIR/curl-error.txt" 2>/dev/null || true
+
+          sleep 8
+          kill "$TAIL_PID" 2>/dev/null || true
+          wait "$TAIL_PID" 2>/dev/null || true
+
+          echo '=== Wrangler live tail output ==='
+          if [ -s "$TAIL_FILE" ]; then
+            cat "$TAIL_FILE"
+          else
+            echo 'Wrangler tail produced no output.'
+          fi
+
+          if [ "$STATUS" = '200' ] && grep -q '"ok":true' "$DIAG_DIR/health-body.txt" 2>/dev/null; then
+            echo 'health_ok=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'health_ok=false' >> "$GITHUB_OUTPUT"
+          fi
+
+          echo 'Diagnostic files saved for the Actions artifact.'
+
+      - name: Upload Worker diagnostic report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: networktoolkit-worker-diagnostics-${{ github.run_id }}
+          path: ${{ runner.temp }}/nt-worker-diagnostics/
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Enforce production health check
+        if: always()
         shell: bash
         run: |
           set -euo pipefail
-          URL="https://networktoolkit-trial-api.huangsxint.workers.dev/health"
-          echo "Checking $URL"
-          for attempt in 1 2 3 4 5; do
-            STATUS="$(curl --silent --show-error --output health.json --write-out '%{http_code}' "$URL" || true)"
-            if [ "$STATUS" = "200" ] && grep -q '"ok":true' health.json; then
-              cat health.json
-              echo "Worker health check passed."
-              exit 0
-            fi
-            echo "Health check attempt $attempt returned HTTP ${STATUS:-no-response}."
-            cat health.json 2>/dev/null || true
-            sleep 5
-          done
-          echo "Worker deployment completed, but the public health check failed. Check Cloudflare Workers Logs and deployment version."
-          exit 1
+          if [ "${{ steps.diagnose.outputs.health_ok }}" != 'true' ]; then
+            echo 'Worker deployment finished, but /health did not return the expected HTTP 200 JSON response.'
+            echo 'Download the networktoolkit-worker-diagnostics artifact and inspect wrangler-tail.jsonl.'
+            echo 'If wrangler tail reports an authorization error, grant the Cloudflare API token Workers Observability Read permission, then rerun this workflow.'
+            exit 1
+          fi
+          echo 'Worker health check passed.'
