@@ -1,0 +1,11 @@
+name = "networktoolkit-trial-api"
+main = "src/index.js"
+compatibility_date = "2026-11-25"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "networktoolkit-trials"
+database_id = "REPLACE_WITH_D1_DATABASE_ID"
+
+[vars]
+TRIAL_DURATION_MS = "86400000"

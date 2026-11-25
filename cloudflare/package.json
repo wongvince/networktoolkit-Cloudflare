@@ -1,0 +1,17 @@
+{
+  "name": "networktoolkit-trial-api",
+  "private": true,
+  "version": "1.0.0",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "db:create": "wrangler d1 create networktoolkit-trials",
+    "db:migrate:local": "wrangler d1 execute networktoolkit-trials --local --file=./schema.sql",
+    "db:migrate:remote": "wrangler d1 execute networktoolkit-trials --remote --file=./schema.sql",
+    "test": "node ./test-worker.mjs"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  },
+  "type": "module"
+}
