@@ -75,3 +75,23 @@ jobs:
 
       - name: Deploy Worker
         run: npx wrangler deploy
+
+      - name: Verify production Worker health endpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+          URL="https://networktoolkit-trial-api.huangsxint.workers.dev/health"
+          echo "Checking $URL"
+          for attempt in 1 2 3 4 5; do
+            STATUS="$(curl --silent --show-error --output health.json --write-out '%{http_code}' "$URL" || true)"
+            if [ "$STATUS" = "200" ] && grep -q '"ok":true' health.json; then
+              cat health.json
+              echo "Worker health check passed."
+              exit 0
+            fi
+            echo "Health check attempt $attempt returned HTTP ${STATUS:-no-response}."
+            cat health.json 2>/dev/null || true
+            sleep 5
+          done
+          echo "Worker deployment completed, but the public health check failed. Check Cloudflare Workers Logs and deployment version."
+          exit 1
